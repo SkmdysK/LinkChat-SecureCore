@@ -1,0 +1,19 @@
+[package]
+name = "secure_core"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+hmac = "0.12"
+pqc_kyber = { version = "0.6", features = ["kyber1024"] }
+rand = "0.8"
+sha2 = "0.10"
+hkdf = "0.12"
+zeroize = { version = "1.7", features = ["alloc", "derive"] }
+libc = "0.2"
