@@ -4,6 +4,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+**English** | [中文](README_CN.md)
 
 SecureCore is the native cryptographic kernel of **LinkChat** — a messaging system designed for threat models where the adversary controls the network, the server, and eventually has access to a cryptographically-relevant quantum computer. It exposes a flat C ABI via 22 `extern "C"` functions designed to be called from Swift (iOS) or Kotlin (Android) via a thin FFI bridge.
 
