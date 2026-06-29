@@ -10,6 +10,7 @@ SecureCore is the native cryptographic kernel of **LinkChat** — a messaging sy
 ## Table of Contents
 
 - [Design Philosophy](#design-philosophy)
+- [Theoretical Foundation](#theoretical-foundation)
 - [Architecture](#architecture)
 - [Module Overview](#module-overview)
 - [Cryptographic Primitives](#cryptographic-primitives)
@@ -54,6 +55,18 @@ A background timer fires every 5 seconds. If a real message is queued, it is sen
 ### 5. Zero Server Architecture
 
 No key directory. No pre-key server. No message queue. No identity server. The only network dependency is TDLib as a blind relay — it sees ciphertext but cannot decrypt, authenticate, or correlate sessions.
+
+---
+
+## Theoretical Foundation
+
+SecureCore's key evolution and self-healing mechanism is formally analyzed in the accompanying research paper:
+
+**[Post-Compromise Security Without External Entropy](docs/paper.pdf)** — *eprint.iacr.org, 2026*
+
+The paper proves that a PRP-based state evolution achieves **tight post-compromise security with zero external entropy**. It shows that the unidirectional self-healing LinkChat implements via `commit_evolution` / `decrypt_with_auto_commit` is theoretically optimal: the adversary's advantage is bounded between τ/2^{λ+1} and τ/2^{λ}, where τ is the number of healing steps and λ is the security parameter. No external entropy source is required beyond the initial root key.
+
+*Anonymous. Priority established via IACR eprint timestamp.*
 
 ---
 
