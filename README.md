@@ -1,454 +1,238 @@
-# SecureCore  — Absolute Blind Cryptographic Kernel
+# SecureCore — Absolute Blind Cryptographic Kernel / 绝对盲密码内核
 
 **Post-quantum, zero-server, peer-to-peer encrypted messaging backend.**
+**后量子、零服务器、点对点加密消息后端。**
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-**English** | [中文](README_CN.md)
+[English](#english) | [中文](#中文)
+
+---
+
+<a name="english"></a>
+## English
 
 SecureCore is the native cryptographic kernel of **LinkChat** — a messaging system designed for threat models where the adversary controls the network, the server, and eventually has access to a cryptographically-relevant quantum computer. It exposes a flat C ABI via 22 `extern "C"` functions designed to be called from Swift (iOS) or Kotlin (Android) via a thin FFI bridge.
 
-## Table of Contents
+### Design Philosophy
 
-- [Design Philosophy](#design-philosophy)
-- [Theoretical Foundation](#theoretical-foundation)
-- [Architecture](#architecture)
-- [Module Overview](#module-overview)
-- [Cryptographic Primitives](#cryptographic-primitives)
-- [Key Lifecycle](#key-lifecycle)
-- [Wire Formats](#wire-formats)
-- [FFI Reference](#ffi-reference)
-- [Error Codes](#error-codes)
-- [Build & Integrate](#build--integrate)
-- [Security Properties](#security-properties)
-- [Comparison to Signal Protocol](#comparison-to-signal-protocol)
-- [Known Limitations](#known-limitations)
-- [License](#license)
+**1. Three Globals Only.** The entire persistent cryptographic state of a session is exactly three values: `ROOT_STATE_CURR : [u8; 32]`, `ROOT_STATE_PEND : Option<[u8; 32]>`, `EPOCH_ID : u32`. No per-message ratchet chain, no look-ahead key queue, no counter chain stored on disk. Every message key is derived on-the-fly via HKDF-SHA256.
 
----
+**2. Physical Trust Root.** Initial key material is exchanged out-of-band via USB-C + BLE. Alice and Bob each contribute entropy bytes, which are odd/even-interleaved and hashed via SHA-256 to produce the initial `RootState`. No asymmetric key exchange traffic exists for a future quantum computer to retroactively decrypt.
 
-## Design Philosophy
+**3. Post-Quantum Forward Secrecy.** Key rotation uses **ML-KEM-1024** (NIST FIPS 203, Category 5). A three-phase protocol — Pending (encapsulation), Exchange (via blind relay), Commit (atomic promotion) — replaces `RootState_curr` with fresh PQ-derived material. Auto-commit detection on the decrypt path ensures both peers converge without an extra round-trip.
 
-### 1. Three Globals Only
+**4. Constant-Flow Cover Traffic.** A background timer fires every 5 seconds. Real messages are sent if queued; otherwise 4096-byte packets of OsRng white noise fill the channel. All packets are exactly 4096 bytes—the social graph is cryptographically hidden.
 
-The entire persistent cryptographic state of a session is exactly three values:
+**5. Zero Server Architecture.** No key directory, pre-key server, message queue, or identity server. The only network dependency is TDLib as a blind relay—it sees ciphertext but cannot decrypt, authenticate, or correlate sessions.
 
-```
-ROOT_STATE_CURR  : [u8; 32]   — current active 256-bit root key
-ROOT_STATE_PEND  : Option<[u8; 32]> — pending post-quantum replacement
-EPOCH_ID         : u32        — session epoch counter
-```
-
-There is no per-message ratchet chain, no look-ahead key queue, no counter chain stored on disk. Every message key is derived on-the-fly via HKDF-SHA256 from `RootState_curr` combined with an atomically-incrementing per-epoch message sequence number.
-
-### 2. Physical Trust Root
-
-Initial key material is exchanged out-of-band via USB-C + BLE. Alice and Bob each contribute entropy bytes, which are odd/even-interleaved in shared memory and hashed via SHA-256 to produce the initial `RootState`. No asymmetric key exchange traffic exists for a future quantum computer to retroactively decrypt.
-
-### 3. Post-Quantum Forward Secrecy
-
-Key rotation uses **ML-KEM-1024** (NIST FIPS 203, Category 5 security level). A three-phase protocol — Pending (encapsulation), Exchange (via blind relay), Commit (atomic promotion) — replaces `RootState_curr` with fresh PQ-derived material. Auto-commit detection on the decrypt path ensures both peers converge without an extra round-trip.
-
-### 4. Constant-Flow Cover Traffic
-
-A background timer fires every 5 seconds. If a real message is queued, it is sent. Otherwise, a 4096-byte packet filled with OsRng white noise is transmitted. All packets are exactly 4096 bytes. To any network observer, every peer at every moment is sending identical-sized indistinguishable packets — the social graph is cryptographically hidden.
-
-### 5. Zero Server Architecture
-
-No key directory. No pre-key server. No message queue. No identity server. The only network dependency is TDLib as a blind relay — it sees ciphertext but cannot decrypt, authenticate, or correlate sessions.
-
----
-
-## Theoretical Foundation
+### Theoretical Foundation
 
 SecureCore's key evolution and self-healing mechanism is formally analyzed in the accompanying research paper:
 
 **[Post-Compromise Security Without External Entropy](docs/paper.pdf)** — *eprint.iacr.org, 2026*
 
-The paper proves that a PRP-based state evolution achieves **tight post-compromise security with zero external entropy**. It shows that the unidirectional self-healing LinkChat implements via `commit_evolution` / `decrypt_with_auto_commit` is theoretically optimal: the adversary's advantage is bounded between τ/2^{λ+1} and τ/2^{λ}, where τ is the number of healing steps and λ is the security parameter. No external entropy source is required beyond the initial root key.
+The paper proves that a PRP-based state evolution achieves **tight post-compromise security with zero external entropy**. The adversary's advantage is bounded between τ/2^{λ+1} and τ/2^{λ}. No external entropy source is required beyond the initial root key.
 
-*Anonymous. Priority established via IACR eprint timestamp.*
+### Module Overview
 
----
+| Module | File | Purpose |
+|--------|------|---------|
+| **FFI Bridge** | `lib.rs` | All 22 `extern "C"` entry points |
+| **Root State** | `root_state.rs` | 3 globals protected by `OnceLock<Mutex<>>` |
+| **Init** | `init_module.rs` | USB-C offline entropy interleave |
+| **Message Cipher** | `message_cipher.rs` | AES-256-GCM + HKDF + auto-commit PCS |
+| **Evolution** | `evolution.rs` | ML-KEM-1024 three-phase PQ key rotation |
+| **Anti-DoS** | `anti_dos.rs` | Epoch roll-forward after packet loss |
+| **Constant Flow** | `constant_flow.rs` | 5s timer + 4KB fixed-size packets |
+| **Tail Padding** | `tail_padding.rs` | [16,512]B OsRng noise append |
+| **Virtual Volume** | `virtual_volume.rs` | ChaCha20Poly1305 per-block AEAD vault |
+| **Memory Protection** | `memory_protection.rs` | SecureBuffer zeroize-on-drop |
+| **Disk Wipe** | `disk_wipe.rs` | Multi-pass secure vault destruction |
+| **Clock Align** | `clock_align.rs` | 16-slot adaptive clock-skew estimator |
 
-## Architecture
+### Cryptographic Primitives
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  Swift / Kotlin (iOS / Android)                          │
-│  Calls C ABI functions with (*const u8, u32) only        │
-├──────────────────────────────────────────────────────────┤
-│  lib.rs                    22 extern "C" FFI functions   │
-├──────────────┬──────────────┬────────────────────────────┤
-│ root_state   │ init_module  │ message_cipher             │
-│ 3 globals    │ USB-C init   │ AES-256-GCM + HKDF-Expand  │
-│ commit/roll  │ ID_Stamp     │ auto-commit PCS            │
-├──────────────┼──────────────┼────────────────────────────┤
-│ evolution    │ anti_dos     │ constant_flow              │
-│ ML-KEM-1024  │ epoch roll   │ 5s timer + 4KB packets     │
-│ 3-phase      │ 100k cap     │ white noise fill           │
-├──────────────┼──────────────┼────────────────────────────┤
-│ tail_padding │ virtual_volume│ memory_protection         │
-│ [16,512]B    │ ChaCha20 AEAD │ SecureBuffer + panic exit │
-│ OsRng noise  │ per-block key│ zeroize-on-drop            │
-├──────────────┴──────────────┼────────────────────────────┤
-│ disk_wipe                   │ clock_align                │
-│ 2-pass + truncate           │ median skew estimator      │
-└─────────────────────────────┴────────────────────────────┘
-```
+| Algorithm | Usage |
+|-----------|-------|
+| **AES-256-GCM** | Message encryption |
+| **ChaCha20Poly1305** | Vault block storage |
+| **ML-KEM-1024** | Post-quantum key evolution |
+| **HKDF-SHA256** | Key derivation, evolution, roll |
+| **HMAC-SHA256** | Per-block vault key derivation |
+| **SHA-256** | ID_Stamp, RootState init, PK binding |
+| **OsRng** | All nonces, padding, noise, wipe passes |
 
-**Module dependency graph:**
-```
-lib.rs ──► all modules (FFI boundary only)
-root_state ──► (standalone + hkdf + sha2)
-message_cipher ──► root_state + aes_gcm + hkdf
-init_module ──► root_state + sha2 + lib.rs(vault helpers)
-evolution ──► root_state + memory_protection + pqc_kyber
-anti_dos ──► root_state
-constant_flow ──► (standalone + rand)
-virtual_volume ──► (standalone + chacha20poly1305 + hmac)
-```
+### Key Lifecycle
 
----
+**Birth — Offline Init:** Bob generates ML-KEM-1024 keypair → physical USB-C + BLE exchange → entropy interleave → SHA-256 → `ROOT_STATE_CURR`, `EPOCH_ID=0`.
 
-## Module Overview
+**Use — Per-Message:** `msg_seq` atomically increments → `Message_Key = HKDF-Expand(ROOT_STATE_CURR, epoch || msg_seq)` → AES-256-GCM encrypt with AAD binding → tail padding → constant-flow to 4096B.
 
-| Module | File | Purpose | Key Types/Functions |
-|--------|------|---------|---------------------|
-| **FFI Bridge** | [`lib.rs`](secure_core/src/lib.rs) | All 22 `extern "C"` entry points, heap allocator, vault singleton | `init_virtual_volume`, `encrypt_message`, `decrypt_with_auto_commit`, `start_evolution` |
-| **Root State** | [`root_state.rs`](secure_core/src/root_state.rs) | 3 global variables protected by `OnceLock<Mutex<>>` | `ROOT_STATE_CURR`, `ROOT_STATE_PEND`, `EPOCH_ID` |
-| **Initialization** | [`init_module.rs`](secure_core/src/init_module.rs) | Offline USB-C entropy interleave, ID_Stamp derivation, entropy quality check | `initialise_root_state`, `compute_id_stamp` |
-| **Message Cipher** | [`message_cipher.rs`](secure_core/src/message_cipher.rs) | AES-256-GCM encrypt/decrypt, HKDF key derivation, auto-commit PCS | `derive_message_key`, `encrypt`, `try_decrypt_with_evolution` |
-| **Evolution** | [`evolution.rs`](secure_core/src/evolution.rs) | ML-KEM-1024 three-phase post-quantum key rotation with MITM detection | `start_evolution`, `apply_peer_kem`, `commit_evolution` |
-| **Anti-DoS** | [`anti_dos.rs`](secure_core/src/anti_dos.rs) | Epoch-based roll-forward recovery after packet loss | `recover_after_loss` |
-| **Constant Flow** | [`constant_flow.rs`](secure_core/src/constant_flow.rs) | 5-second rigid timer, 4KB fixed-size packets, TRNG fill | `start_constant_flow`, `build_noise_packet` |
-| **Tail Padding** | [`tail_padding.rs`](secure_core/src/tail_padding.rs) | Append [16,512] bytes OsRng noise + 2B length trailer | `add_tail_padding`, `strip_tail_padding` |
-| **Virtual Volume** | [`virtual_volume.rs`](secure_core/src/virtual_volume.rs) | Single-file AES-encrypted vault (`vault.sec`), per-block ChaCha20Poly1305, bitmap allocator, canary honeytraps | 4096B blocks, 262,144 max data blocks, ~1 GiB usable |
-| **Memory Protection** | [`memory_protection.rs`](secure_core/src/memory_protection.rs) | `SecureBuffer` (zeroize-on-drop), `execute_panic_exit` (SIGTERM + 3ms + `_exit(1)`) | `SecureBuffer`, `execute_panic_exit` |
-| **Disk Wipe** | [`disk_wipe.rs`](secure_core/src/disk_wipe.rs) | Multi-pass secure vault destruction: OsRng random → zeros → truncate → fsync | `purge_entire_vault` |
-| **Clock Align** | [`clock_align.rs`](secure_core/src/clock_align.rs) | Adaptive clock-skew estimator using 16-slot ring buffer of counter deltas | `init_clock_align`, `estimated_skew` |
+**Rotate — PCS:** Alice encapsulates → `RootState_pend` via HKDF-Extract → sends KEM ct → Bob decapsulates, derives same pend, commits → Alice's decrypt fails, tries pend, auto-commits.
 
----
+**Recover — Anti-DoS:** `recover_after_loss(target_epoch)` rolls forward epoch-by-epoch via HKDF (max 100,000 gap).
 
-## Cryptographic Primitives
-
-| Algorithm | Crate | Key Size | Mode / Construction | Usage |
-|-----------|-------|----------|---------------------|-------|
-| **AES-256-GCM** | `aes_gcm` | 256-bit | GCM (12B nonce, 16B tag) | Message encryption |
-| **ChaCha20Poly1305** | `chacha20poly1305` | 256-bit | AEAD (12B nonce, 16B tag per write) | Vault block storage |
-| **ML-KEM-1024** | `pqc_kyber` | SK 3168B, PK 1568B, SS 32B | KEM (Encaps/Decaps) | Post-quantum key evolution |
-| **HKDF-SHA256** | `hkdf` + `sha2` | 256-bit IKM/OKM | Extract-then-Expand (RFC 5869) | Message key derivation, evolution, roll |
-| **HMAC-SHA256** | `hmac` + `sha2` | 256-bit key | MAC (used as KDF) | Vault per-block key derivation |
-| **SHA-256** | `sha2` | — | Hash | ID_Stamp, RootState init, PK binding |
-| **OsRng** | `rand::rngs::OsRng` | — | OS CSPRNG | All nonces, padding, noise, wipe passes |
-
-### Domain Separation Strings
-
-| String | Salt/Info | Module | Context |
-|--------|-----------|--------|---------|
-| `"LinkChat HKDF Expand"` | HKDF salt | `message_cipher` | Message key derivation |
-| `"LinkChat Evolution"` | HKDF info | `evolution` | Pending key derivation |
-| `"LinkChat RootState Init"` | Hash prefix | `init_module` | RootState from interleaved entropy |
-| `"LinkChat ID Stamp"` | Hash prefix | `init_module` | Identity stamp (binds RootState + Bob PK) |
-| `"LinkChat Epoch Roll"` | HKDF info | `anti_dos` | Epoch roll-forward |
-| `"epoch_roll"` | HKDF salt | `anti_dos` | Epoch roll-forward |
-| `"blk_key_v1"` | HMAC message | `virtual_volume` | Per-block key derivation |
-
----
-
-## Key Lifecycle
-
-### Birth — Offline Initialization
-```
-1. Bob generates ML-KEM-1024 keypair (pk: 1568B, sk: 3168B)
-2. Alice + Bob physically connect (USB-C + BLE)
-3. Bob sends: entropy_bytes + public_key
-4. init_root_state(alice_entropy, bob_entropy, bob_pk)
-   → entropy quality check (reject all-zero / all-same / < 64B)
-   → odd_even_interleave(alice, bob)
-   → SHA-256("LinkChat RootState Init" || interleaved)
-   → ROOT_STATE_CURR[32], EPOCH_ID = 0
-5. generate_id_stamp()
-   → SHA-256("LinkChat ID Stamp" || RootState_init || bob_pk)
-   → written to vault block 994
-   → ALL future messages bind to this session via id_stamp in AAD
-```
-
-### Use — Per-Message Encryption
-```
-msg_seq = atomic_fetch_add(MSG_COUNTER, 1)   // never 0
-Message_Key = HKDF-Expand(
-    salt = "LinkChat HKDF Expand",
-    ikm  = ROOT_STATE_CURR,
-    info = [epoch(4B LE) || msg_seq(8B LE)]
-)  → 32 bytes
-
-nonce = [epoch(4B) || (timestamp ^ msg_seq)(8B)]  → 12 bytes, deterministic
-
-AAD = [
-    id_stamp(32B)    || direction(1B: 0=out/1=in) ||
-    epoch(4B LE)     || msg_seq(8B LE) ||
-    timestamp(8B LE) || proto_version(2B LE = 4)
-]  → 55 bytes total
-
-Wire format: [12B nonce || AES-256-GCM ciphertext || 16B GCM tag]
-Then:      add_tail_padding(wire) → [wire || noise_L || u16_le(L)]
-Then:      constant_flow → padded to exactly 4096 bytes
-```
-
-### Rotate — Post-Quantum Evolution (PCS)
-```
-Phase 1 (Alice):
-  start_evolution()
-    → pqc_kyber::encapsulate(bob_pk, &mut OsRng)
-    → (kem_ct: 1568B, shared_secret_S: 32B)
-    → RootState_pend = HKDF-Extract(salt=S, ikm=RootState_curr)
-    → stored in global, kem_ct sent to Bob via TDLib
-
-Phase 2 (Bob):
-  apply_peer_kem(kem_ct)
-    → pqc_kyber::decapsulate(kem_ct, sk)
-    → same shared_secret_S: 32B
-    → same RootState_pend derivation
-    → Bob commits → sends reply with new epoch
-
-Phase 3 (Alice):
-  decrypt_with_auto_commit(reply)
-    → decryption with RootState_curr fails
-    → tries RootState_pend → success
-    → auto-commit: RootState_curr ← RootState_pend, epoch++, msg_counter=1
-```
-
-### Recover — Anti-DoS Epoch Roll
-```
-recover_after_loss(target_epoch)
-  for each missed epoch:
-    RootState_curr = HKDF-Extract(salt="epoch_roll", ikm=RootState_curr)
-    epoch += 1
-  Maximum gap: 100,000 epochs per call
-```
-
----
-
-## Wire Formats
-
-### Encrypted Message
-```
-[12B: nonce (epoch||timestamp^msg_seq)] [N B: AES-256-GCM ct] [16B: GCM tag]
-Minimum: 28 bytes
-```
-
-### After Tail Padding
-```
-[encrypted message] [L B: OsRng noise, 16≤L≤512] [2B: u16 LE L]
-```
-
-### Constant-Flow Packet
-```
-Exactly 4096 bytes (real message padded with OsRng, or pure noise)
-```
-
-### Vault Block (4096 bytes on disk)
-```
-[12B: random ChaCha20Poly1305 nonce] [4084B: encrypted payload + 16B tag]
-PAYLOAD_SIZE = 4068 bytes of plaintext per block
-```
-
-### Vault Superblock (Block 0)
-```
-u32 LE magic = 0x5345_4333 ("SEC3")
-u32 LE version = 3
-u64 LE total_blocks
-u64 LE free_blocks
-[u8; 32] master_key_hash = SHA-256(master_key)
-[u8; 4040] reserved (zeros)
-```
-
-### Canary Honeytrap (Blocks 995–999)
-```
-"CANARY"(6B) | slot_index(1B) | version=0x01(1B) | OsRng padding(4060B)
-```
-
-### KEM Ciphertext
-```
-ML-KEM-1024 encaps output: 1568 bytes
-Shared secret: 32 bytes
-```
-
----
-
-## FFI Reference
-
-All 22 `extern "C"` functions. Every data pointer is `*const u8` or `*mut u8`. Every length is `u32`. Memory returned to caller must be freed via `release_native_buffer`.
-
-### Vault I/O
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `init_virtual_volume` | `(path, path_len, key, key_len, total) → u32` | 0=ok, 1/2/3=error |
-| `read_vault_blocks` | `(start, n, out) → u32` | blocks read |
-| `write_vault_blocks` | `(start, n, data) → u32` | blocks written |
-| `allocate_vault_block` | `() → u64` | block index or u64::MAX |
-| `free_vault_block` | `(idx) → u32` | 0=ok |
-| `secure_erase_block` | `(idx) → u32` | 0=ok |
-| `vault_total_blocks` | `() → u64` | count |
-| `vault_free_blocks` | `() → u64` | count |
-| `validate_canary_slots` | `() → u32` | 0=intact, 2=tampered |
-| `init_canary_slots` | `() → u32` | 0=ok |
-| `purge_vault` | `(path, path_len) → u32` | never returns on success |
-
-### Root State & Identity
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `init_root_state` | `(a, a_len, b, b_len, pk, pk_len) → u32` | 0=ok, 1/2/3=error |
-| `get_epoch_id` | `() → u32` | current epoch |
-| `generate_id_stamp` | `() → u32` | 0=ok |
-| `load_id_stamp` | `(out, out_cap) → u32` | 0=ok |
-
-### Message Encrypt/Decrypt
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `msg_counter_next` | `() → u64` | sequence number |
-| `msg_counter_current` | `() → u64` | sequence number |
-| `derive_message_key` | `(epoch, msg_seq) → *mut u8` | 32B heap key |
-| `encrypt_message` | `(pt, pt_len, key, stamp, outgoing, epoch, msg_seq, timestamp, out_len) → *mut u8` | ciphertext or null |
-| `decrypt_message` | `(ct, ct_len, key, stamp, outgoing, epoch, msg_seq, timestamp, out_len) → *mut u8` | plaintext or null |
-| `decrypt_with_auto_commit` | `(... , did_commit) → *mut u8` | plaintext + auto-commit flag |
-| `zeroize_key` | `(ptr, len) → u32` | 0 |
-| `add_tail_padding` | `(data, data_len, out_len) → *mut u8` | padded or null |
-| `strip_tail_padding` | `(data, data_len, out_len) → *mut u8` | payload or null |
-
-### Post-Quantum Evolution
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `evolution_generate_bob_keypair` | `(pk, pk_cap, sk, sk_cap) → u32` | 0=ok |
-| `evolution_set_peer_public_key` | `(pk, pk_len) → u32` | 0=ok |
-| `start_evolution` | `() → u32` | 0=ok, 1/2/4/5=error |
-| `kem_cipher_len` | `() → u32` | byte count |
-| `get_kem_cipher` | `(out, cap) → u32` | bytes written |
-| `apply_peer_kem` | `(ct, ct_len) → u32` | 0=ok, 2/3/4=error |
-| `commit_evolution` | `() → u32` | 0=ok, 1=no pending |
-
-### Cover Traffic & Recovery
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `build_noise_packet` | `(out, out_len) → u32` | 0=ok |
-| `start_constant_flow` | `(cb: TxCallback) → u32` | 0=ok, 1=already-running |
-| `stop_constant_flow` | `() → u32` | 0 |
-| `recover_after_loss` | `(target_epoch) → u32` | new epoch or u32::MAX |
-| `init_clock_align` | `()` | void |
-| `estimated_clock_skew` | `() → i64` | counter steps |
-
-### Heap
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `allocate_native_buffer` | `(size) → *mut u8` | heap pointer or null |
-| `release_native_buffer` | `(ptr, len)` | void (zeroize + free) |
-
----
-
-## Error Codes
-
-| Code | Meaning |
-|------|---------|
-| **0** | Success |
-| **1** | Null pointer / zero-length input / insufficient data / no pending key / general error |
-| **2** | Invalid UTF-8 path / canary tampered / empty peer public key / entropy quality rejected |
-| **3** | Vault I/O error / Bob secret key not found |
-| **4** | Shared secret length mismatch (not exactly 32B from ML-KEM-1024) |
-| **5** | Public key tampered — SHA-256 hash mismatch (MITM detection) |
-| **u64::MAX** | Vault allocation failed |
-| **u32::MAX** | HKDF failure or epoch gap > 100,000 |
-
----
-
-## Build & Integrate
-
-### Prerequisites
-- Rust 1.70+
-- `cargo`
-
-### Build
-```bash
-cd secure_core
-cargo build --release
-# Output:
-#   target/release/libsecure_core.a   — static library (iOS/macOS)
-#   target/release/libsecure_core.so  — dynamic library (Android/Linux)
-```
-
-### Test
-```bash
-cargo test
-# 21 tests: roundtrip encrypt/decrypt, evolution cycle, vault block I/O,
-#           tail padding, anti-DoS recovery, memory protection, clock align
-```
-
-### Integrate with iOS (Swift)
-Link `libsecure_core.a` into your Xcode project. All functions are `extern "C"` with raw pointers. The Swift bridge (`NativeBridge.swift`) wraps each FFI call with `Array.withUnsafeBytes` / `UnsafeMutablePointer` conversions.
-
----
-
-## Security Properties
+### Security Properties
 
 | Property | Status | Mechanism |
 |----------|--------|-----------|
 | Message confidentiality | ✅ | AES-256-GCM per-message AEAD |
-| Per-message key independence | ✅ | HKDF-Expand from RootState with unique `(epoch, msg_seq)` |
-| Cross-epoch forward secrecy | ✅ | ML-KEM-1024 three-phase key evolution |
-| Post-compromise security | ✅ | Auto-commit on decrypt detects peer's new epoch |
-| Ciphertext authentication | ✅ | GCM 16B tag + AAD binding (id_stamp, direction, epoch, seq, timestamp, protocol version) |
-| Anti-replay | ⚠️ | Unique `msg_seq` per epoch; caller must track `max_seq_seen` |
-| Post-quantum | ✅ | ML-KEM-1024 for all key rotation (Category 5) |
-| Traffic analysis resistance | ✅ | 5s constant-flow, 4KB fixed packets, white-noise fill |
-| Local storage encryption | ✅ | ChaCha20Poly1305 per-block AEAD vault |
-| Deniability | ✅ | Symmetric keys only (no signatures) + one-click vault purge |
-| Metadata protection | ✅ | `freeze_timestamps()` after every vault I/O |
-| Tamper detection | ✅ | Canary honeytrap blocks (995–999) + AEAD on all data blocks |
-| Memory safety | ✅ | `SecureBuffer` zeroize-on-drop, key copies zeroized after use |
-| Server trust | ✅ | Zero server architecture — TDLib is blind relay only |
+| Per-message key independence | ✅ | HKDF-Expand (epoch, msg_seq) |
+| Cross-epoch forward secrecy | ✅ | ML-KEM-1024 three-phase evolution |
+| Post-compromise security | ✅ | Auto-commit on decrypt |
+| Ciphertext authentication | ✅ | GCM 16B tag + AAD binding |
+| Anti-replay | ⚠️ | Caller tracks max_seq_seen |
+| Post-quantum | ✅ | ML-KEM-1024 (Category 5) |
+| Traffic analysis resistance | ✅ | 5s constant-flow + 4KB packets |
+| Local storage encryption | ✅ | ChaCha20Poly1305 per-block AEAD |
+| Deniability | ✅ | Symmetric keys only + one-click purge |
+| Tamper detection | ✅ | Canary honeytraps + AEAD |
+| Memory safety | ✅ | SecureBuffer zeroize-on-drop |
+| Zero server trust | ✅ | TDLib blind relay only |
 
-### What Is NOT Protected
-- Compromised device (jailbreak / root)
-- Telegram metadata (TDLib sees timing, IP, message size)
-- Screenshots / manual forwarding by recipient
-- Social engineering / SAS oral verification failure
-- Unencrypted iTunes/Finder backups containing `vault.sec`
-- Physical coercion (deniable encryption mitigates but does not eliminate)
+**Not protected:** compromised device, Telegram metadata, screenshots, social engineering, unencrypted backups, physical coercion.
 
----
+### Comparison to Signal
 
-## Comparison to Signal Protocol
-
-| Property | Signal Protocol | SecureCore  |
-|----------|----------------|---------------|
-| Initial key exchange | X3DH over network | USB-C + BLE physical interleave |
-| Per-message PCS | DH Ratchet (automatic) | Epoch-level (explicit trigger) |
+| Property | Signal | SecureCore |
+|----------|--------|------------|
+| Initial key exchange | X3DH over network | USB-C + BLE physical |
+| Per-message PCS | DH Ratchet (auto) | Epoch-level (explicit) |
 | PCS healing time | 1–2 round-trips | 1 KEM round-trip |
-| Post-quantum | PQXDH (initial exchange only) | Full ML-KEM-1024 (all rotations) |
+| Post-quantum | PQXDH (initial only) | Full ML-KEM-1024 |
 | Metadata protection | None | Constant-flow cover traffic |
-| Server dependency | Mandatory (pre-key server) | None (TDLib blind relay) |
-| Identity | Asymmetric Curve25519 | Symmetric ID_Stamp (SHA-256) |
-| Async messaging | Yes (pre-key bundles) | No (synchronous only) |
+| Server dependency | Mandatory | None (blind relay) |
+| Async messaging | ✅ | ❌ |
 
-For a detailed analysis, see [`SIGNAL_COMPARISON.md`](SIGNAL_COMPARISON.md) (if present in the repo).
+### Known Limitations
+
+1. No per-message DH ratchet — epoch-level PCS only.
+2. No async messaging — both peers online for init/evolution.
+3. No multi-device support.
+4. No PBKDF2/Argon2 for vault key.
+5. Message counter in-memory only.
+6. Single vault singleton.
+7. No network I/O in Rust.
+8. Disk wipe is cryptographic, not physical.
+9. `register_touch` is a stub.
+10. Clock align forward-seek not implemented.
+
+### License
+
+MIT
 
 ---
 
-## Known Limitations
+<a name="中文"></a>
+## 中文
 
-1. **No per-message DH ratchet.** Epoch-level PCS requires explicit ML-KEM evolution for healing.
-2. **No asynchronous messaging.** Both peers must be online for initialization and evolution commit.
-3. **No multi-device support.** ID_Stamp binds to a single pairing session.
-4. **No PBKDF2/Argon2 for vault master key.** The 32-byte key is used directly.
-5. **Message sequence counter is in-memory only.** Resets to 1 on process restart.
-6. **Single vault singleton.** Only one `vault.sec` can be open at a time.
-7. **No network I/O in Rust.** All transport is delegated to Swift/Kotlin via callback.
-8. **Disk wipe is cryptographic, not physical.** APFS/SSD wear-leveling prevents guaranteed physical overwrite.
-9. **`register_touch` is a stub.** GUI touch tracking is not implemented.
-10. **Clock align forward-seek is documented but not implemented.**
+SecureCore 是 **LinkChat** 的本地密码学内核 —— 面向敌手同时控制网络、服务器且最终拥有量子计算机的威胁模型。通过 22 个 `extern "C"` 函数暴露扁平 C ABI，经由薄 FFI 桥接层从 Swift (iOS) 或 Kotlin (Android) 调用。
 
----
+### 设计哲学
 
-## License
+**1. 仅三个全局量。** 会话的整个持久化密码学状态仅由三个值组成：`ROOT_STATE_CURR : [u8; 32]`、`ROOT_STATE_PEND : Option<[u8; 32]>`、`EPOCH_ID : u32`。无逐消息棘轮链、无预读密钥队列、无磁盘计数器链。每条消息密钥通过 HKDF-SHA256 实时派生。
+
+**2. 物理信任根。** 初始密钥材料通过 USB-C + BLE 带外交换。Alice 和 Bob 各自贡献熵字节，奇偶交错哈希经 SHA-256 生成初始 `RootState`。不存在可供未来量子计算机追溯解密的非对称密钥交换流量。
+
+**3. 后量子前向安全。** 密钥轮换使用 **ML-KEM-1024**（NIST FIPS 203，Category 5）。三步协议——待处理（封装）、交换（盲中继）、提交（原子提升）——将 `RootState_curr` 替换为新鲜 PQ 派生材料。解密路径上的自动提交检测确保双方无需额外往返即可收敛。
+
+**4. 恒定流封面流量。** 后台定时器每 5 秒触发。有真实消息则发送；否则发送 4096 字节 OsRng 白噪声。所有数据包严格 4096 字节——社交图谱被密码学隐藏。
+
+**5. 零服务器架构。** 无密钥目录、无预密钥服务器、无消息队列、无身份服务器。唯一网络依赖 TDLib 作为盲中继——可见密文但无法解密、认证或关联会话。
+
+### 理论基础
+
+SecureCore 的密钥演化和自愈机制有配套研究论文提供形式化安全分析：
+
+**[Post-Compromise Security Without External Entropy](docs/paper.pdf)** — *eprint.iacr.org, 2026*
+
+论文证明了基于 PRP 的状态演化在**零外部熵**条件下实现紧致后妥协安全。敌手优势被界定在 τ/2^{λ+1} 与 τ/2^{λ} 之间。除初始根密钥外无需任何外部熵源。
+
+### 模块概览
+
+| 模块 | 功能 |
+|:---|:---|
+| **FFI 桥接** | 全部 22 个 `extern "C"` 入口点 |
+| **根状态** | `OnceLock<Mutex<>>` 保护的三全局变量 |
+| **初始化** | USB-C 离线熵交错、ID_Stamp 派生 |
+| **消息加密** | AES-256-GCM + HKDF 密钥派生 + 自动提交 PCS |
+| **密钥演化** | ML-KEM-1024 三相后量子密钥轮换 |
+| **抗 DoS** | 丢包后 epoch 前滚恢复 |
+| **恒定流** | 5s 定时器 + 4KB 固定包 + 白噪声 |
+| **尾填充** | [16,512]B OsRng 噪声追加 |
+| **虚拟卷** | ChaCha20Poly1305 逐块 AEAD 保险库 |
+| **内存保护** | `SecureBuffer` 释放即清零 |
+| **磁盘擦除** | 多次安全擦除：随机 → 零 → 截断 → fsync |
+| **时钟对齐** | 16 槽自适应时钟偏差估计 |
+
+### 密码学原语
+
+| 算法 | 用途 |
+|:---|:---|
+| **AES-256-GCM** | 消息加密 |
+| **ChaCha20Poly1305** | 保险库块存储 |
+| **ML-KEM-1024** | 后量子密钥演化 |
+| **HKDF-SHA256** | 密钥派生、演化、前滚 |
+| **HMAC-SHA256** | 保险库逐块密钥派生 |
+| **SHA-256** | ID_Stamp、RootState 初始化 |
+| **OsRng** | nonce、填充、噪声、擦除 |
+
+### 密钥生命周期
+
+**诞生：** Bob 生成 ML-KEM-1024 密钥对 → USB-C + BLE 物理交换 → 熵交错 → SHA-256 → `ROOT_STATE_CURR`、`EPOCH_ID=0`。
+
+**使用：** `msg_seq` 原子递增 → `Message_Key = HKDF-Expand(ROOT_STATE_CURR, epoch || msg_seq)` → AES-256-GCM 加密（AAD 绑定）→ 尾填充 → 恒定流至 4096B。
+
+**轮换 (PCS)：** Alice 封装 → `RootState_pend` → 发送 KEM 密文 → Bob 解封、派生相同 pend、提交 → Alice 解密失败、尝试 pend、自动提交。
+
+**恢复：** `recover_after_loss(target_epoch)` 逐 epoch HKDF 前滚（最大 100,000）。
+
+### 安全属性
+
+| 属性 | 状态 | 机制 |
+|:---|:---|:---|
+| 消息机密性 | ✅ | AES-256-GCM 逐消息 AEAD |
+| 逐消息密钥独立 | ✅ | HKDF-Expand (epoch, msg_seq) |
+| 跨 epoch 前向安全 | ✅ | ML-KEM-1024 三相密钥演化 |
+| 后妥协安全 (PCS) | ✅ | 解密时自动提交 |
+| 密文认证 | ✅ | GCM 16B 标签 + AAD 绑定 |
+| 抗重放 | ⚠️ | 调用方跟踪 max_seq_seen |
+| 后量子 | ✅ | ML-KEM-1024 (Category 5) |
+| 流量分析抵抗 | ✅ | 5s 恒定流 + 4KB 固定包 |
+| 本地存储加密 | ✅ | ChaCha20Poly1305 逐块 AEAD |
+| 可否认性 | ✅ | 纯对称密钥 + 一键销毁 |
+| 防篡改 | ✅ | 蜜罐金丝雀块 + AEAD |
+| 内存安全 | ✅ | SecureBuffer 释放即清零 |
+| 零服务器信任 | ✅ | TDLib 仅盲中继 |
+
+**不保护：** 已攻破设备、Telegram 元数据、截屏/转发、社工、未加密备份、物理胁迫。
+
+### 对比 Signal
+
+| 属性 | Signal | SecureCore |
+|:---|:---|:---|
+| 初始密钥交换 | X3DH 网络协议 | USB-C + BLE 物理 |
+| 逐消息 PCS | DH 棘轮（自动） | Epoch 级（显式触发） |
+| PCS 愈合时间 | 1–2 往返 | 1 次 KEM 往返 |
+| 后量子 | PQXDH（仅初始） | 全 ML-KEM-1024 |
+| 元数据保护 | 无 | 恒定流封面流量 |
+| 服务器依赖 | 强制 | 无（盲中继） |
+| 异步消息 | ✅ | ❌ |
+
+### 已知局限
+
+1. 无逐消息 DH 棘轮。
+2. 无异步消息。
+3. 无多设备支持。
+4. 无 PBKDF2/Argon2。
+5. 消息计数器仅存内存。
+6. 单一保险库单例。
+7. Rust 层无网络 I/O。
+8. 磁盘擦除为密码学级别。
+9. `register_touch` 为存根。
+10. 时钟对齐前向查找未实现。
+
+### 许可
 
 MIT
